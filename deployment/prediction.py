@@ -1,3 +1,6 @@
+from django.conf import settings
+import os
+
 # predict_seizure.py
 import numpy as np
 import mne
@@ -10,23 +13,51 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class EEGSeizurePredictor:
-    def __init__(self, model_path='seizure_cnn_model.h5'):
-        self.model_path = model_path
-        self.sampling_rate = 256
-        self.window_size = 10  # 5 seconds
-        self.overlap = 0.5    # 50% overlap
-        self.n_channels = 23  # CHB-MIT standard
+
+    def __init__(self, models_dir=None):
+
+            if models_dir is None:
+                models_dir = os.path.join(
+                    os.path.dirname(__file__),  # predictor folder
+                    "models"                    # models folder inside predictor
+                )
+
+            self.models_dir = models_dir
+            self.model = None
+
+
+            self.sampling_rate = 256
+            self.window_size = 10
+            self.overlap = 0.25
+            self.n_channels = 23
+
         
-        # Load the trained model
-        self.load_model()
-    
-    def load_model(self):
-        """Load the trained CNN model"""
-        if os.path.exists(self.model_path):
-            self.model = tf.keras.models.load_model(self.model_path)
-            print(f" Model loaded: {self.model_path}")
-        else:
-            raise FileNotFoundError(f"Model not found: {self.model_path}")
+    def load_patient_model(self, edf_file_path):
+
+        base = os.path.basename(edf_file_path)
+
+        parts = base.split("_")
+
+        # Find patient part like chb01
+        patient = None
+        for p in parts:
+            if p.startswith("chb"):
+                patient = p
+                break
+
+        if patient is None:
+            raise ValueError("❌ Cannot detect patient from filename")
+
+        model_name = f"seizure_model_{patient}.h5"
+
+        model_path = os.path.join(self.models_dir, model_name)
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"❌ Model not found for {patient}: {model_path}")
+
+        self.model = tf.keras.models.load_model(model_path)
+
+        print(f" Loaded model for patient: {patient}")
     
     def load_edf_file(self, filename):
         try:
@@ -69,7 +100,7 @@ class EEGSeizurePredictor:
 
             return data, fs
         except Exception as e:
-            print(f" Error loading {filename}: {str(e)}")
+            print(f"❌ Error loading {filename}: {str(e)}")
             return None, None
     
     def create_windows(self, data):
@@ -92,21 +123,47 @@ class EEGSeizurePredictor:
         return np.array(windows), np.array(timestamps)
     
     def predict_seizures(self, edf_file_path):
-        """Predict seizures using CNN"""
+
+        # Load correct model
+        self.load_patient_model(edf_file_path)
+
+        # Load EEG
         data, fs = self.load_edf_file(edf_file_path)
-        if data is None:
-            return None, None, None
-        
+
         windows, timestamps = self.create_windows(data)
-        
-        # Reshape for CNN: (N, time_steps, channels)
-        X = windows.transpose(0, 2, 1)  # (N, 1280, 23)
-        
-        print(f" Predicting on {len(windows)} windows...")
-        probabilities = self.model.predict(X, verbose=0).flatten()
+
+        # CNN input shape
+        X = windows.transpose(0, 2, 1)
+        X = X[..., np.newaxis]
+
+        #  Correct Patient Extraction
+        base = os.path.basename(edf_file_path)
+        parts = base.split("_")
+
+        patient = None
+        for p in parts:
+            if p.startswith("chb"):
+                patient = p
+                break
+
+        if patient is None:
+            raise ValueError("❌ Patient ID not found in filename!")
+
+        pid = int(patient.replace("chb", "")) - 1
+        patient_id = np.full((X.shape[0], 1), pid)
+
+        # Predict
+        probabilities = self.model.predict(
+            [X, patient_id],
+            verbose=0
+        ).flatten()
+
         predictions = (probabilities > 0.5).astype(int)
-        
+
         return predictions, probabilities, timestamps
+
+
+
     
     def analyze_risk(self, probabilities, timestamps, time_window=60):
         """Analyze risk in larger time bins"""
@@ -164,42 +221,81 @@ class EEGSeizurePredictor:
         
         plt.tight_layout()
         
-        # Save plot
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         plot_name = f"{os.path.splitext(os.path.basename(edf_file_path))[0]}_prediction_{timestamp}.png"
-        plt.savefig(plot_name, dpi=300, bbox_inches='tight')
-        print(f" Plot saved: {plot_name}")
-        plt.show()
+
+        plot_path = os.path.join(settings.STATICFILES_DIRS[0], plot_name)
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+
+        return {
+            "static_url": f"/static/{plot_name}",
+            "inline_data": ""
+        }
+
+
     
     def print_summary(self, edf_file_path, predictions, probabilities, timestamps):
         """Print detailed prediction summary"""
-        total_hours = len(timestamps) * self.window_size / 3600
-        seizure_windows = np.sum(predictions)
-        high_risk_windows = np.sum(probabilities > 0.7)
-        
-        print("\n" + "="*60)
-        print(f" SEIZURE PREDICTION SUMMARY")
+                # ============================
+        #    HIGH-RISK WINDOWS
+        # ============================
+
+        high_risk_mask = probabilities > 0.5
+        high_times = timestamps[high_risk_mask] / 3600  # convert to hours
+
+        if len(high_times) > 0:
+
+            # -------------------------------------------------------
+            # 1) GROUP HIGH-RISK WINDOWS INTO CLUSTERS (SEIZURE ZONES)
+            # -------------------------------------------------------
+            gaps = np.diff(high_times)
+            blocks = []
+            current_block = [high_times[0]]
+
+            for i, g in enumerate(gaps):
+                if g < 0.01:   # <0.01 hr (~0.6 min) → same cluster
+                    current_block.append(high_times[i+1])
+                else:
+                    blocks.append(current_block)
+                    current_block = [high_times[i+1]]
+            blocks.append(current_block)
+
+            # Largest block = actual seizure zone
+            seizure_block = max(blocks, key=len)
+            seizure_start = seizure_block[0]
+            seizure_end = seizure_block[-1]
+
+            print(f"\n🧠 ACTUAL SEIZURE (estimated):")
+            print(f"   Start: {seizure_start:.3f} hr")
+            print(f"   End:   {seizure_end:.3f} hr")
+
+            # -------------------------------------------------------
+            # 2) EXTRACT ONLY REAL PRE-ALERTS 
+            #    (before seizure, ignoring post-seizure & far alerts)
+            # -------------------------------------------------------
+            pre_alerts = []
+
+            for t in high_times:
+                diff_hr = seizure_start - t
+                diff_min = diff_hr * 60
+
+                # Keep only alerts before seizure and not too far away
+                if 0 < diff_min <= 5:
+                    pre_alerts.append((t, diff_min))
+
+            print(f"\n⏳ PRE-ALERTS:")
+
+            if len(pre_alerts) == 0:
+                print("   No meaningful early warnings detected.")
+            else:
+                for t, m in pre_alerts:
+                    print(f"   {t:.3f} hr → {m:.1f} min before seizure")
+
+        else:
+            print("\n No high-risk periods detected.")
+
         print("="*60)
-        print(f" File: {os.path.basename(edf_file_path)}")
-        print(f"  Duration: {total_hours:.2f} hours")
-        print(f" Total windows: {len(probabilities):,}")
-        print(f" Predicted seizure windows: {seizure_windows:,} ({seizure_windows/len(probabilities)*100:.2f}%)")
-        print(f"  High-risk windows (>70%): {high_risk_windows:,} ({high_risk_windows/len(probabilities)*100:.2f}%)")
-        print(f" Average probability: {np.mean(probabilities):.3f}")
-        print(f" Maximum probability: {np.max(probabilities):.3f}")
-        print(f" Minimum probability: {np.min(probabilities):.3f}")
-        
-        # High risk periods
-        high_risk_mask = probabilities > 0.7
-        if np.any(high_risk_mask):
-            high_times = timestamps[high_risk_mask] / 3600
-            print(f"\n  HIGH RISK PERIODS (hours):")
-            for i, t in enumerate(high_times[:10]):  # Show first 10
-                print(f"   {t:.3f}")
-            if len(high_times) > 10:
-                print(f"   ... and {len(high_times)-10} more")
-        
-        print("="*60)
+
     
     def predict_file(self, edf_file_path, show_plot=True):
         """Main prediction function"""
@@ -207,7 +303,7 @@ class EEGSeizurePredictor:
         
         predictions, probabilities, timestamps = self.predict_seizures(edf_file_path)
         if predictions is None:
-            print(" Prediction failed!")
+            print("❌ Prediction failed!")
             return
         
         # Print summary
@@ -223,26 +319,20 @@ class EEGSeizurePredictor:
 
 # =============== COMMAND LINE USAGE ===============
 def main():
-    parser = argparse.ArgumentParser(description='Predict seizures from EEG EDF file')
-    parser.add_argument('filename', type=str, help='Path to EDF file')
-    parser.add_argument('--model', type=str, default='seizure_cnn_model.h5', 
-                       help='Path to trained model (default: seizure_cnn_model.h5)')
-    parser.add_argument('--no-plot', action='store_true', 
-                       help='Skip plotting (faster execution)')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("filename", type=str)
+
     args = parser.parse_args()
-    
-    # Check if file exists
+
     if not os.path.exists(args.filename):
-        print(f"❌ File not found: {args.filename}")
+        print("❌ File not found")
         return
-    
-    # Initialize predictor
-    predictor = EEGSeizurePredictor(model_path=args.model)
-    
-    # Predict
-    show_plot = not args.no_plot
-    predictor.predict_file(args.filename, show_plot=show_plot)
+
+    #  Personalized predictor
+    predictor = EEGSeizurePredictor()
+
+    predictor.predict_file(args.filename)
+
 
 
 if __name__ == "__main__":
