@@ -46,14 +46,14 @@ class EEGSeizurePredictor:
                 break
 
         if patient is None:
-            raise ValueError("❌ Cannot detect patient from filename")
+            raise ValueError(" Cannot detect patient from filename")
 
         model_name = f"seizure_model_{patient}.h5"
 
         model_path = os.path.join(self.models_dir, model_name)
 
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"❌ Model not found for {patient}: {model_path}")
+            raise FileNotFoundError(f Model not found for {patient}: {model_path}")
 
         self.model = tf.keras.models.load_model(model_path)
 
@@ -100,7 +100,7 @@ class EEGSeizurePredictor:
 
             return data, fs
         except Exception as e:
-            print(f"❌ Error loading {filename}: {str(e)}")
+            print(f" Error loading {filename}: {str(e)}")
             return None, None
     
     def create_windows(self, data):
@@ -147,7 +147,7 @@ class EEGSeizurePredictor:
                 break
 
         if patient is None:
-            raise ValueError("❌ Patient ID not found in filename!")
+            raise ValueError(" Patient ID not found in filename!")
 
         pid = int(patient.replace("chb", "")) - 1
         patient_id = np.full((X.shape[0], 1), pid)
@@ -265,7 +265,7 @@ class EEGSeizurePredictor:
             seizure_start = seizure_block[0]
             seizure_end = seizure_block[-1]
 
-            print(f"\n🧠 ACTUAL SEIZURE (estimated):")
+            print(f"\n ACTUAL SEIZURE (estimated):")
             print(f"   Start: {seizure_start:.3f} hr")
             print(f"   End:   {seizure_end:.3f} hr")
 
@@ -303,7 +303,7 @@ class EEGSeizurePredictor:
         
         predictions, probabilities, timestamps = self.predict_seizures(edf_file_path)
         if predictions is None:
-            print("❌ Prediction failed!")
+            print(" Prediction failed!")
             return
         
         # Print summary
@@ -325,7 +325,7 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.filename):
-        print("❌ File not found")
+        print(" File not found")
         return
 
     #  Personalized predictor
