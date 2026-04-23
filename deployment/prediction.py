@@ -10,6 +10,8 @@ import os
 from datetime import datetime
 import argparse
 import warnings
+from scipy.ndimage import gaussian_filter1d
+
 warnings.filterwarnings('ignore')
 
 class EEGSeizurePredictor:
@@ -24,6 +26,7 @@ class EEGSeizurePredictor:
 
             self.models_dir = models_dir
             self.model = None
+            self.attention_model = None
 
 
             self.sampling_rate = 256
@@ -32,36 +35,32 @@ class EEGSeizurePredictor:
             self.n_channels = 23
 
         
-    def load_patient_model(self, edf_file_path):
+    def load_model(self):
 
-        base = os.path.basename(edf_file_path)
-
-        parts = base.split("_")
-
-        # Find patient part like chb01
-        patient = None
-        for p in parts:
-            if p.startswith("chb"):
-                patient = p
-                break
-
-        if patient is None:
-            raise ValueError(" Cannot detect patient from filename")
-
-        model_name = f"seizure_model_{patient}.h5"
-
-        model_path = os.path.join(self.models_dir, model_name)
+        model_path = os.path.join(self.models_dir, "seizure_cnn_colab.h5")
 
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f Model not found for {patient}: {model_path}")
+            raise FileNotFoundError("❌ Model not found")
 
-        self.model = tf.keras.models.load_model(model_path)
+        self.model = tf.keras.models.load_model(
+            model_path,
+            custom_objects={
+                'sum_over_time': lambda x: tf.reduce_sum(x, axis=1)
+            },
+            compile=False
+        )
 
-        print(f" Loaded model for patient: {patient}")
+        # 🔥 Extract attention from same model
+        self.attention_model = tf.keras.Model(
+            inputs=self.model.inputs,
+            outputs=self.model.get_layer("multi_head_attention_3").output
+        )
+
+        print("✅ Model + Attention ready")
     
     def load_edf_file(self, filename):
         try:
-            print(f" Loading {filename}...")
+            print(f"📂 Loading {filename}...")
             raw = mne.io.read_raw_edf(filename, preload=True, verbose=False)
             fs = raw.info['sfreq']
 
@@ -100,7 +99,7 @@ class EEGSeizurePredictor:
 
             return data, fs
         except Exception as e:
-            print(f" Error loading {filename}: {str(e)}")
+            print(f"❌ Error loading {filename}: {str(e)}")
             return None, None
     
     def create_windows(self, data):
@@ -122,10 +121,52 @@ class EEGSeizurePredictor:
         
         return np.array(windows), np.array(timestamps)
     
+    def get_attention(self, X, patient_id):
+
+        attn = self.attention_model.predict([X, patient_id], verbose=0)
+
+        if isinstance(attn, list) or isinstance(attn, tuple):
+            attn = attn[1]
+            
+        attn = np.array(attn)
+
+        print("ATTN SHAPE:", attn.shape)
+        # expected: (batch, heads, time, time)
+
+        # -----------------------------
+        # 1. Average heads
+        # -----------------------------
+        attn_mean = np.mean(attn, axis=1)   # (batch, time, time)
+
+        # -----------------------------
+        # 2. Temporal importance
+        # -----------------------------
+        importance = np.sum(attn_mean, axis=1)   # 🔥 KEY
+        # (batch, time)
+
+        # -----------------------------
+        # 3. Collapse per window
+        # -----------------------------
+        importance = np.mean(importance, axis=-1)   # (batch,)
+
+        # -----------------------------
+        # 4. Normalize
+        # -----------------------------
+        importance = (importance - np.min(importance)) / \
+                    (np.max(importance) - np.min(importance) + 1e-8)
+
+        # -----------------------------
+        # 5. Smooth (VERY IMPORTANT)
+        # -----------------------------
+        importance = gaussian_filter1d(importance, sigma=2)
+
+        return importance
+        
     def predict_seizures(self, edf_file_path):
 
         # Load correct model
-        self.load_patient_model(edf_file_path)
+        if self.model is None:
+            self.load_model()
 
         # Load EEG
         data, fs = self.load_edf_file(edf_file_path)
@@ -136,7 +177,7 @@ class EEGSeizurePredictor:
         X = windows.transpose(0, 2, 1)
         X = X[..., np.newaxis]
 
-        #  Correct Patient Extraction
+        # ✅ Correct Patient Extraction
         base = os.path.basename(edf_file_path)
         parts = base.split("_")
 
@@ -147,7 +188,7 @@ class EEGSeizurePredictor:
                 break
 
         if patient is None:
-            raise ValueError(" Patient ID not found in filename!")
+            raise ValueError("❌ Patient ID not found in filename!")
 
         pid = int(patient.replace("chb", "")) - 1
         patient_id = np.full((X.shape[0], 1), pid)
@@ -158,9 +199,13 @@ class EEGSeizurePredictor:
             verbose=0
         ).flatten()
 
-        predictions = (probabilities > 0.5).astype(int)
+        THRESHOLD = 0.58
+        predictions = (probabilities > THRESHOLD).astype(int)
+        attention = self.get_attention(X, patient_id)
 
-        return predictions, probabilities, timestamps
+        importance = attention
+
+        return predictions, probabilities, timestamps, importance
 
 
 
@@ -184,7 +229,7 @@ class EEGSeizurePredictor:
         
         return time_groups
     
-    def plot_prediction(self, edf_file_path, predictions, probabilities, timestamps):
+    def plot_prediction(self, edf_file_path, predictions, probabilities, timestamps, importance):
         """Plot seizure predictions"""
         plt.style.use('default')
         plt.figure(figsize=(15, 10))
@@ -193,8 +238,8 @@ class EEGSeizurePredictor:
         plt.subplot(2, 1, 1)
         hours = np.array(timestamps) / 3600
         plt.plot(hours, probabilities, 'b-', alpha=0.7, linewidth=1, label='Seizure Probability')
-        plt.axhline(y=0.5, color='r', linestyle='--', label='Threshold (0.5)')
-        plt.fill_between(hours, 0, probabilities, where=(probabilities > 0.5),
+        plt.axhline(y=0.58, color='r', linestyle='--', label='Threshold (0.58)')
+        plt.fill_between(hours, 0, probabilities, where=(probabilities > 0.58),
                          color='red', alpha=0.3, label='Predicted Seizure')
         plt.xlabel('Time (hours)')
         plt.ylabel('Probability')
@@ -226,9 +271,41 @@ class EEGSeizurePredictor:
 
         plot_path = os.path.join(settings.STATICFILES_DIRS[0], plot_name)
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        
+        # ---- Separate Attention Graph ----
+        plt.figure(figsize=(12, 4))
+
+        hours = np.array(timestamps) / 3600
+
+        plt.plot(hours, importance, color='red', linewidth=1.5, label='Attention Importance')
+
+        # Highlight high attention regions
+        threshold_attn = np.percentile(importance, 90)
+
+        plt.fill_between(hours, 0, importance,
+                        where=(importance > threshold_attn),
+                        color='red', alpha=0.3,
+                        label='High Attention Region')
+
+        plt.xlabel("Time (hours)")
+        plt.ylabel("Importance")
+        plt.title(f"Model Attention (Interpretability) - {os.path.basename(edf_file_path)}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Save attention plot
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        attn_plot_name = f"{os.path.splitext(os.path.basename(edf_file_path))[0]}_attention_{timestamp}.png"
+
+        attn_plot_path = os.path.join(settings.STATICFILES_DIRS[0], attn_plot_name)
+        plt.savefig(attn_plot_path, dpi=300, bbox_inches='tight')
+
+        print(f"📊 Attention plot saved: {attn_plot_name}")
+        plt.show()
 
         return {
             "static_url": f"/static/{plot_name}",
+            "attention_url": f"/static/{attn_plot_name}",
             "inline_data": ""
         }
 
@@ -240,7 +317,7 @@ class EEGSeizurePredictor:
         #    HIGH-RISK WINDOWS
         # ============================
 
-        high_risk_mask = probabilities > 0.5
+        high_risk_mask = probabilities > 0.58
         high_times = timestamps[high_risk_mask] / 3600  # convert to hours
 
         if len(high_times) > 0:
@@ -265,7 +342,7 @@ class EEGSeizurePredictor:
             seizure_start = seizure_block[0]
             seizure_end = seizure_block[-1]
 
-            print(f"\n ACTUAL SEIZURE (estimated):")
+            print(f"\n🧠 ACTUAL SEIZURE (estimated):")
             print(f"   Start: {seizure_start:.3f} hr")
             print(f"   End:   {seizure_end:.3f} hr")
 
@@ -292,7 +369,7 @@ class EEGSeizurePredictor:
                     print(f"   {t:.3f} hr → {m:.1f} min before seizure")
 
         else:
-            print("\n No high-risk periods detected.")
+            print("\n⚠️ No high-risk periods detected.")
 
         print("="*60)
 
@@ -301,9 +378,9 @@ class EEGSeizurePredictor:
         """Main prediction function"""
         print(f"\n Starting prediction for: {edf_file_path}")
         
-        predictions, probabilities, timestamps = self.predict_seizures(edf_file_path)
+        predictions, probabilities, timestamps, importance = self.predict_seizures(edf_file_path)
         if predictions is None:
-            print(" Prediction failed!")
+            print("❌ Prediction failed!")
             return
         
         # Print summary
@@ -311,10 +388,10 @@ class EEGSeizurePredictor:
         
         # Plot results
         if show_plot:
-            self.plot_prediction(edf_file_path, predictions, probabilities, timestamps)
+            self.plot_prediction(edf_file_path, predictions, probabilities, timestamps, importance)
         
-        print(f"\n Prediction completed!")
-        return predictions, probabilities, timestamps
+        print(f"\n✅ Prediction completed!")
+        return predictions, probabilities, timestamps, importance
 
 
 # =============== COMMAND LINE USAGE ===============
@@ -325,10 +402,10 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.filename):
-        print(" File not found")
+        print("❌ File not found")
         return
 
-    #  Personalized predictor
+    # ✅ Personalized predictor
     predictor = EEGSeizurePredictor()
 
     predictor.predict_file(args.filename)
